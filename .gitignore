@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# runtime uploads and temp
+uploads/
+tmp/
+.cache/
+
+# build and coverage
+dist/
+coverage/
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# os files
+.DS_Store
+Thumbs.db
+
+# env secrets
+.env
+.env.*
+!.env.example
