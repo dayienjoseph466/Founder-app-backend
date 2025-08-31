@@ -15,25 +15,107 @@ const User = require("./models/User");
 const Task = require("./models/Task");
 const Log = require("./models/Log");
 const Review = require("./models/Review");
-// NOTE: we compute scores via the raw collection (no model import needed)
-// const Score = require("./models/Score");
 const auth = require("./middleware/auth");
 
 const app = express();
 
-/* ----------------------------- app setup ----------------------------- */
-app.use(cors({ origin: "http://localhost:5173", credentials: true }));
+/* ======================= base app setup ======================= */
 app.use(express.json());
 
+// CORS allow list based on env and common dev hosts
+const devAllowed = ["http://localhost:5173", "http://localhost:3000"];
+const envAllowed = (process.env.CORS_ALLOWED_ORIGINS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // tools and curl
+  try {
+    const u = new URL(origin);
+    if (devAllowed.includes(origin)) return true;
+    if (envAllowed.includes(origin)) return true;
+    // allow vercel previews and prod subdomains
+    if (u.hostname.endsWith(".vercel.app")) return true;
+  } catch {}
+  return false;
+}
+
+app.use(
+  cors({
+    origin(origin, cb) {
+      if (isAllowedOrigin(origin)) return cb(null, true);
+      cb(new Error("CORS blocked"));
+    },
+    credentials: true
+  })
+);
+
+// trust proxy when behind render
+app.set("trust proxy", 1);
+
+// simple health
+app.get("/api/health", (_req, res) => res.json({ ok: true }));
+
+/* ======================= uploads setup ======================== */
 const uploadsDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 app.use("/uploads", express.static(uploadsDir));
 
-/* ----------------------------- database ------------------------------ */
+// hybrid upload
+// use cloud when CLOUDINARY_URL is set, else use local disk
+const useCloud = !!process.env.CLOUDINARY_URL;
+
+let upload;
+let saveProof; // async (file) => returns a string url or local path
+let removeProofFileIfLocal; // (proofUrl) => void
+
+if (useCloud) {
+  // memory upload and stream to cloud
+  const mem = multer({ storage: multer.memoryStorage() });
+  upload = mem;
+
+  const { v2: cloudinary } = require("cloudinary"); // uses CLOUDINARY_URL
+  const streamifier = require("streamifier");
+
+  saveProof = async function saveToCloud(file) {
+    return new Promise((resolve, reject) => {
+      const publicId = Date.now() + "-" + file.originalname;
+      const uploadStream = cloudinary.uploader.upload_stream(
+        { folder: "founder-app", public_id: publicId, resource_type: "auto" },
+        (err, result) => (err ? reject(err) : resolve(result.secure_url))
+      );
+      streamifier.createReadStream(file.buffer).pipe(uploadStream);
+    });
+  };
+
+  removeProofFileIfLocal = function noop() {};
+} else {
+  // disk upload
+  const storage = multer.diskStorage({
+    destination: uploadsDir,
+    filename: (_req, file, cb) => cb(null, Date.now() + "-" + file.originalname),
+  });
+  upload = multer({ storage });
+
+  saveProof = async function saveToDisk(file) {
+    return `/uploads/${file.filename}`;
+  };
+
+  removeProofFileIfLocal = function removeLocal(proofUrl) {
+    try {
+      if (!proofUrl || !proofUrl.startsWith("/uploads/")) return;
+      const abs = path.join(uploadsDir, proofUrl.replace("/uploads/", ""));
+      fs.unlink(abs, () => {});
+    } catch {}
+  };
+}
+
+/* ======================= database connect ===================== */
 (async function connectDB() {
   try {
-    const uri = process.env.MONGO_URI;
-    if (!uri) throw new Error("MONGO_URI missing in .env");
+    const uri = process.env.MONGODB_URI || process.env.MONGO_URI;
+    if (!uri) throw new Error("MONGODB_URI or MONGO_URI missing in env");
     await mongoose.connect(uri, { serverSelectionTimeoutMS: 8000 });
     console.log("Mongo connected");
 
@@ -44,25 +126,10 @@ app.use("/uploads", express.static(uploadsDir));
   }
 })();
 
-/* ------------------------------ uploads ------------------------------ */
-const storage = multer.diskStorage({
-  destination: uploadsDir,
-  filename: (_req, file, cb) => cb(null, Date.now() + "-" + file.originalname),
-});
-const upload = multer({ storage });
-
-function removeProofFileIfLocal(proofUrl) {
-  try {
-    if (!proofUrl || !proofUrl.startsWith("/uploads/")) return;
-    const abs = path.join(uploadsDir, proofUrl.replace("/uploads/", ""));
-    fs.unlink(abs, () => {});
-  } catch {}
-}
-
-/* -------------------------------- utils ------------------------------ */
+/* ======================= helpers and consts =================== */
 const JWT_SECRET = process.env.JWT_SECRET || "devsecret";
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 
-// Who must review whose submissions
 const REQUIRED_REVIEW_ROLES = {
   CEO: ["COO", "MARKETING"],
   COO: ["CEO", "MARKETING"],
@@ -73,12 +140,6 @@ const requiredRolesFor = (submitterRole) =>
 
 const oid = (id) => new mongoose.Types.ObjectId(id);
 
-// direct access to scores collection
-function scoresColl() {
-  return mongoose.connection.collection("scores");
-}
-
-/* ---- helpers: safe ObjectId and date normalization ---- */
 function toObjectIdSafe(v) {
   try {
     if (!v) return null;
@@ -97,10 +158,11 @@ function normDateStr(d) {
   return s;
 }
 
-/* -------------------------------- health ----------------------------- */
-app.get("/api/health", (_req, res) => res.json({ ok: true }));
+function scoresColl() {
+  return mongoose.connection.collection("scores");
+}
 
-/* ------------------------------ USER AUTH ---------------------------- */
+/* ======================= auth routes ========================== */
 app.get("/api/auth/me", auth, (req, res) =>
   res.json({ id: req.user.id, name: req.user.name, role: req.user.role })
 );
@@ -108,7 +170,6 @@ app.get("/api/auth/me", auth, (req, res) =>
 app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body || {};
-    // important fix: include passwordHash which is select false in schema
     const user = await User.findOne({ email }).select("+passwordHash");
     if (!user) return res.status(401).json({ error: "no user" });
 
@@ -127,10 +188,7 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-/* --------- PASSWORD RESET FLOW: forgot and finalize reset ------------ */
-const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
-
-// send email if SMTP is configured, otherwise log the link in the server console
+/* =================== password reset flow ====================== */
 async function sendResetEmail(to, link) {
   const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM } = process.env;
   if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
@@ -145,7 +203,7 @@ async function sendResetEmail(to, link) {
     auth: { user: SMTP_USER, pass: SMTP_PASS },
   });
   await transporter.sendMail({
-    from: EMAIL_FROM || "no-reply@example.com",
+    from: EMAIL_FROM || "noreply@example.com",
     to,
     subject: "Reset your password",
     html: `<p>Click the link below to set a new password. This link expires in 15 minutes.</p>
@@ -153,7 +211,6 @@ async function sendResetEmail(to, link) {
   });
 }
 
-// request a reset link
 app.post("/api/auth/forgot", async (req, res) => {
   try {
     const { email } = req.body || {};
@@ -179,7 +236,6 @@ app.post("/api/auth/forgot", async (req, res) => {
   }
 });
 
-// finalize reset with the token and new password
 app.post("/api/auth/reset", async (req, res) => {
   try {
     const { token, newPassword } = req.body || {};
@@ -208,7 +264,7 @@ app.post("/api/auth/reset", async (req, res) => {
   }
 });
 
-/* ------------------------------ ADMIN AUTH --------------------------- */
+/* =================== admin auth for dashboard ================= */
 app.post("/api/admin/auth/login", (req, res) => {
   try {
     const { email, password } = req.body || {};
@@ -216,7 +272,7 @@ app.post("/api/admin/auth/login", (req, res) => {
     const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 
     if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
-      return res.status(500).json({ error: "ADMIN_EMAIL or ADMIN_PASSWORD missing in .env" });
+      return res.status(500).json({ error: "ADMIN_EMAIL or ADMIN_PASSWORD missing in env" });
     }
 
     if (email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
@@ -237,7 +293,7 @@ app.post("/api/admin/auth/login", (req, res) => {
   }
 });
 
-/* --------------------------------- seed ------------------------------ */
+/* ========================== seed data ========================= */
 async function runSeed(_req, res) {
   try {
     const count = await User.countDocuments();
@@ -283,7 +339,7 @@ async function runSeed(_req, res) {
 app.post("/api/seed", runSeed);
 app.get("/api/seed", runSeed);
 
-/* -------------------------------- tasks ------------------------------ */
+/* ============================ tasks =========================== */
 app.get("/api/tasks", auth, async (req, res) => {
   try {
     const role = req.user.role;
@@ -297,7 +353,7 @@ app.get("/api/tasks", auth, async (req, res) => {
   }
 });
 
-/* --------------------------- ADMIN TASKS CRUD ------------------------- */
+/* ======================= admin tasks crud ===================== */
 app.get("/api/admin/tasks", auth, async (req, res) => {
   try {
     if (req.user.role !== "ADMIN" && req.user.role !== "CEO")
@@ -361,19 +417,20 @@ app.delete("/api/admin/tasks/:id", auth, async (req, res) => {
   }
 });
 
-/* -------------------------------- logs ------------------------------- */
-// create first submission
+/* ============================ logs ============================ */
 app.post("/api/logs", auth, upload.single("proof"), async (req, res) => {
   try {
     const { taskId, date, note } = req.body;
     if (!note || !req.file) return res.status(400).json({ error: "note and proof are required" });
+
+    const proofPath = await saveProof(req.file);
 
     const log = await Log.create({
       userId: req.user.id,
       taskId,
       date,
       note: note.trim(),
-      proofUrl: `/uploads/${req.file.filename}`,
+      proofUrl: proofPath,
       status: "PENDING",
       reviewRound: 1,
     });
@@ -383,18 +440,18 @@ app.post("/api/logs", auth, upload.single("proof"), async (req, res) => {
   }
 });
 
-// upsert or resubmit
 app.post("/api/logs/upsert", auth, upload.single("proof"), async (req, res) => {
   try {
     const { taskId, date, note } = req.body;
     if (!note || !req.file) return res.status(400).json({ error: "note and proof are required" });
 
     let log = await Log.findOne({ userId: req.user.id, taskId, date });
+    const proofPath = await saveProof(req.file);
 
     if (log) {
       removeProofFileIfLocal(log.proofUrl);
       log.note = note.trim();
-      log.proofUrl = `/uploads/${req.file.filename}`;
+      log.proofUrl = proofPath;
       log.status = "PENDING";
       log.reviewRound = (log.reviewRound || 1) + 1;
       await log.save();
@@ -405,7 +462,7 @@ app.post("/api/logs/upsert", auth, upload.single("proof"), async (req, res) => {
         taskId,
         date,
         note: note.trim(),
-        proofUrl: `/uploads/${req.file.filename}`,
+        proofUrl: proofPath,
         status: "PENDING",
         reviewRound: 1,
       });
@@ -418,7 +475,6 @@ app.post("/api/logs/upsert", auth, upload.single("proof"), async (req, res) => {
   }
 });
 
-// edit existing
 app.put("/api/logs/:id", auth, upload.single("proof"), async (req, res) => {
   try {
     const { note } = req.body;
@@ -427,9 +483,11 @@ app.put("/api/logs/:id", auth, upload.single("proof"), async (req, res) => {
     let log = await Log.findOne({ _id: req.params.id, userId: req.user.id });
     if (!log) return res.status(404).json({ error: "no log" });
 
+    const proofPath = await saveProof(req.file);
+
     removeProofFileIfLocal(log.proofUrl);
     log.note = note.trim();
-    log.proofUrl = `/uploads/${req.file.filename}`;
+    log.proofUrl = proofPath;
     log.status = "PENDING";
     log.reviewRound = (log.reviewRound || 1) + 1;
     await log.save();
@@ -441,7 +499,6 @@ app.put("/api/logs/:id", auth, upload.single("proof"), async (req, res) => {
   }
 });
 
-// my logs with review breakdown
 app.get("/api/logs", auth, async (req, res) => {
   try {
     const { date } = req.query;
@@ -491,7 +548,6 @@ app.get("/api/logs", auth, async (req, res) => {
   }
 });
 
-// delete my log
 app.delete("/api/logs/:id", auth, async (req, res) => {
   try {
     const log = await Log.findOne({ _id: req.params.id, userId: req.user.id });
@@ -507,7 +563,7 @@ app.delete("/api/logs/:id", auth, async (req, res) => {
   }
 });
 
-/* ----------------------------- reviews ------------------------------- */
+/* =========================== reviews ========================== */
 app.get("/api/reviews/pending", auth, async (req, res) => {
   try {
     const { date } = req.query;
@@ -593,7 +649,7 @@ app.post("/api/reviews", auth, async (req, res) => {
   }
 });
 
-/* ----------------------------- admin logs ---------------------------- */
+/* ======================= admin log views ====================== */
 app.get("/api/admin/logs", auth, async (req, res) => {
   try {
     if (req.user.role !== "ADMIN" && req.user.role !== "CEO")
@@ -629,8 +685,7 @@ app.delete("/api/admin/logs/:id", auth, async (req, res) => {
   }
 });
 
-/* -------------------------------- score ------------------------------ */
-// single rule — 5 points per VERIFIED task
+/* ======================== score and board ===================== */
 async function recomputeScoreInternal(userId, date) {
   try {
     const uid = toObjectIdSafe(userId);
@@ -698,7 +753,6 @@ app.get("/api/score", auth, async (req, res) => {
   }
 });
 
-// Lifetime scoreboard
 app.get("/api/scoreboard", auth, async (_req, res) => {
   try {
     const cursor = scoresColl().aggregate([
@@ -753,7 +807,6 @@ app.get("/api/scoreboard", auth, async (_req, res) => {
   }
 });
 
-// Hard reset all lifetime scoreboard data
 app.post("/api/admin/score/reset", auth, async (req, res) => {
   try {
     if (req.user.role !== "ADMIN" && req.user.role !== "CEO") {
@@ -782,7 +835,6 @@ app.post("/api/admin/score/reset", auth, async (req, res) => {
   }
 });
 
-// Admin backfill then recompute all
 app.post("/api/admin/score/rebuild", auth, async (req, res) => {
   try {
     if (req.user.role !== "ADMIN" && req.user.role !== "CEO")
@@ -810,7 +862,7 @@ app.post("/api/admin/score/rebuild", auth, async (req, res) => {
   }
 });
 
-/* ----------------------- data retention (2 days) --------------------- */
+/* ===================== data retention cleanup ================= */
 function ymd(d) {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
@@ -858,13 +910,13 @@ setInterval(() => {
   cleanupOldData().catch((e) => console.error("cleanup error:", e.message));
 }, 6 * 60 * 60 * 1000);
 
-/* --------------------------- process safety logs --------------------- */
+/* ============================ process ========================= */
 process.on("unhandledRejection", (err) => console.error("Unhandled Rejection:", err));
 process.on("uncaughtException", (err) => {
   console.error("Uncaught Exception:", err);
   process.exit(1);
 });
 
-/* --------------------------------- start ----------------------------- */
+/* ============================ start =========================== */
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => console.log("server on " + PORT));
