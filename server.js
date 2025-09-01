@@ -15,6 +15,7 @@ const User = require("./models/User");
 const Task = require("./models/Task");
 const Log = require("./models/Log");
 const Review = require("./models/Review");
+const Admin = require("./models/Admin"); // <-- Admin model
 const auth = require("./middleware/auth");
 
 const app = express();
@@ -26,7 +27,7 @@ app.use(express.json());
 const devAllowed = ["http://localhost:5173", "http://localhost:3000"];
 const envAllowed = (process.env.CORS_ALLOWED_ORIGINS || "")
   .split(",")
-  .map(s => s.trim())
+  .map((s) => s.trim())
   .filter(Boolean);
 
 function isAllowedOrigin(origin) {
@@ -47,7 +48,7 @@ app.use(
       if (isAllowedOrigin(origin)) return cb(null, true);
       cb(new Error("CORS blocked"));
     },
-    credentials: true
+    credentials: true,
   })
 );
 
@@ -119,7 +120,9 @@ if (useCloud) {
     await mongoose.connect(uri, { serverSelectionTimeoutMS: 8000 });
     console.log("Mongo connected");
 
-    try { await Review.syncIndexes(); } catch {}
+    try {
+      await Review.syncIndexes();
+    } catch {}
   } catch (err) {
     console.error("Mongo connect failed:", err.message);
     process.exit(1);
@@ -188,7 +191,7 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-/* =================== password reset flow ====================== */
+/* =================== password reset flow (users) ============== */
 async function sendResetEmail(to, link) {
   const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM } = process.env;
   if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
@@ -264,18 +267,102 @@ app.post("/api/auth/reset", async (req, res) => {
   }
 });
 
-/* =================== admin auth for dashboard ================= */
-app.post("/api/admin/auth/login", (req, res) => {
+/* =========== admin forgot/reset (Admins collection + email) ==== */
+app.post("/api/admin/auth/forgot", async (req, res) => {
   try {
-    const { email, password } = req.body || {};
-    const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
-    const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+    const { email } = req.body || {};
+    if (!email) return res.status(400).send("Email required");
 
-    if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
-      return res.status(500).json({ error: "ADMIN_EMAIL or ADMIN_PASSWORD missing in env" });
+    const admin = await Admin.findOne({ email: String(email).toLowerCase() });
+    const finish = () =>
+      res.json({ ok: true, message: "If that email exists we sent a reset link" });
+
+    if (!admin) return finish();
+
+    const token = jwt.sign(
+      { id: admin._id, purpose: "admin-reset" },
+      JWT_SECRET,
+      { expiresIn: "15m" }
+    );
+    const link = `${FRONTEND_URL}/admin/reset-password?token=${encodeURIComponent(
+      token
+    )}`;
+
+    await sendResetEmail(admin.email, link);
+    return finish();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/admin/auth/reset", async (req, res) => {
+  try {
+    const { token, newPassword } = req.body || {};
+    if (!token || !newPassword) return res.status(400).send("Missing fields");
+
+    let payload;
+    try {
+      payload = jwt.verify(token, JWT_SECRET);
+    } catch {
+      return res.status(400).send("Invalid or expired token");
+    }
+    if (payload.purpose !== "admin-reset" || !payload.id) {
+      return res.status(400).send("Invalid token");
     }
 
-    if (email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
+    const admin = await Admin.findById(payload.id).select("+passwordHash");
+    if (!admin) return res.status(400).send("Invalid token");
+
+    const salt = await bcrypt.genSalt(10);
+    admin.passwordHash = await bcrypt.hash(newPassword, salt);
+    await admin.save();
+
+    res.json({ ok: true, message: "Password updated. Please login" });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* =================== admin auth for dashboard =================
+   1) Try Admins collection (hashed password)
+   2) Fallback to ADMIN_EMAIL / ADMIN_PASSWORD from .env
+================================================================ */
+app.post("/api/admin/auth/login", async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) {
+      return res.status(400).json({ error: "email and password required" });
+    }
+
+    // 1) DB admin
+    const adminDoc = await Admin.findOne({
+      email: String(email).toLowerCase(),
+    }).select("+passwordHash");
+
+    if (adminDoc) {
+      const ok = await bcrypt.compare(password, adminDoc.passwordHash);
+      if (!ok) return res.status(401).json({ error: "invalid admin credentials" });
+
+      const token = jwt.sign(
+        { id: adminDoc._id, name: adminDoc.name, role: "ADMIN" },
+        JWT_SECRET,
+        { expiresIn: "7d" }
+      );
+      return res.json({
+        token,
+        admin: { id: adminDoc._id, name: adminDoc.name, email: adminDoc.email },
+      });
+    }
+
+    // 2) Env fallback
+    const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
+    const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+    if (
+      ADMIN_EMAIL &&
+      ADMIN_PASSWORD &&
+      email === ADMIN_EMAIL &&
+      password === ADMIN_PASSWORD
+    ) {
       const token = jwt.sign(
         { id: "admin", name: "System Admin", role: "ADMIN" },
         JWT_SECRET,
@@ -294,22 +381,54 @@ app.post("/api/admin/auth/login", (req, res) => {
 });
 
 /* ========================== seed data ========================= */
+app.post("/api/seed", runSeed);
+app.get("/api/seed", runSeed);
+
 async function runSeed(_req, res) {
   try {
     const count = await User.countDocuments();
     if (count > 0) return res.json({ ok: true, note: "already seeded" });
 
-    const CEO_EMAIL = process.env.SEED_USERS_CEO_EMAIL || "ceo@qiksol.com";
-    const CEO_PASS = process.env.SEED_USERS_CEO_PASS || "admin123";
-    const COO_EMAIL = process.env.SEED_USERS_COO_EMAIL || "coo@qiksol.com";
-    const COO_PASS = process.env.SEED_USERS_COO_PASS || "admin123";
-    const MKT_EMAIL = process.env.SEED_USERS_MARKETING_EMAIL || "marketing@qiksol.com";
-    const MKT_PASS = process.env.SEED_USERS_MARKETING_PASS || "admin123";
+    // .env only (no fallbacks)
+    const {
+      SEED_USERS_CEO_EMAIL,
+      SEED_USERS_CEO_PASS,
+      SEED_USERS_COO_EMAIL,
+      SEED_USERS_COO_PASS,
+      SEED_USERS_MARKETING_EMAIL,
+      SEED_USERS_MARKETING_PASS,
+    } = process.env;
+
+    if (
+      !SEED_USERS_CEO_EMAIL ||
+      !SEED_USERS_CEO_PASS ||
+      !SEED_USERS_COO_EMAIL ||
+      !SEED_USERS_COO_PASS ||
+      !SEED_USERS_MARKETING_EMAIL ||
+      !SEED_USERS_MARKETING_PASS
+    ) {
+      return res.status(500).json({ error: "Missing SEED_USERS_* env vars" });
+    }
 
     const users = [
-      { name: "Dayien Joseph", email: CEO_EMAIL, role: "CEO", passwordHash: await bcrypt.hash(CEO_PASS, 10) },
-      { name: "Arjun", email: COO_EMAIL, role: "COO", passwordHash: await bcrypt.hash(COO_PASS, 10) },
-      { name: "John Paul", email: MKT_EMAIL, role: "MARKETING", passwordHash: await bcrypt.hash(MKT_PASS, 10) },
+      {
+        name: "Dayien Joseph",
+        email: SEED_USERS_CEO_EMAIL,
+        role: "CEO",
+        passwordHash: await bcrypt.hash(SEED_USERS_CEO_PASS, 10),
+      },
+      {
+        name: "Arjun",
+        email: SEED_USERS_COO_EMAIL,
+        role: "COO",
+        passwordHash: await bcrypt.hash(SEED_USERS_COO_PASS, 10),
+      },
+      {
+        name: "John Paul",
+        email: SEED_USERS_MARKETING_EMAIL,
+        role: "MARKETING",
+        passwordHash: await bcrypt.hash(SEED_USERS_MARKETING_PASS, 10),
+      },
     ];
     await User.insertMany(users);
 
@@ -336,8 +455,6 @@ async function runSeed(_req, res) {
     res.status(500).json({ ok: false, error: e.message });
   }
 }
-app.post("/api/seed", runSeed);
-app.get("/api/seed", runSeed);
 
 /* ============================ tasks =========================== */
 app.get("/api/tasks", auth, async (req, res) => {
@@ -421,7 +538,8 @@ app.delete("/api/admin/tasks/:id", auth, async (req, res) => {
 app.post("/api/logs", auth, upload.single("proof"), async (req, res) => {
   try {
     const { taskId, date, note } = req.body;
-    if (!note || !req.file) return res.status(400).json({ error: "note and proof are required" });
+    if (!note || !req.file)
+      return res.status(400).json({ error: "note and proof are required" });
 
     const proofPath = await saveProof(req.file);
 
@@ -443,7 +561,8 @@ app.post("/api/logs", auth, upload.single("proof"), async (req, res) => {
 app.post("/api/logs/upsert", auth, upload.single("proof"), async (req, res) => {
   try {
     const { taskId, date, note } = req.body;
-    if (!note || !req.file) return res.status(400).json({ error: "note and proof are required" });
+    if (!note || !req.file)
+      return res.status(400).json({ error: "note and proof are required" });
 
     let log = await Log.findOne({ userId: req.user.id, taskId, date });
     const proofPath = await saveProof(req.file);
@@ -478,7 +597,8 @@ app.post("/api/logs/upsert", auth, upload.single("proof"), async (req, res) => {
 app.put("/api/logs/:id", auth, upload.single("proof"), async (req, res) => {
   try {
     const { note } = req.body;
-    if (!note || !req.file) return res.status(400).json({ error: "note and proof are required" });
+    if (!note || !req.file)
+      return res.status(400).json({ error: "note and proof are required" });
 
     let log = await Log.findOne({ _id: req.params.id, userId: req.user.id });
     if (!log) return res.status(404).json({ error: "no log" });
@@ -508,7 +628,7 @@ app.get("/api/logs", auth, async (req, res) => {
 
     if (logs.length === 0) return res.json([]);
 
-    const ids = logs.map(l => l._id);
+    const ids = logs.map((l) => l._id);
     const reviews = await Review.find({ logId: { $in: ids } })
       .populate("reviewerId", "name role")
       .lean();
@@ -520,13 +640,13 @@ app.get("/api/logs", auth, async (req, res) => {
       byLogRound.get(key).push(r);
     }
 
-    const result = logs.map(l => {
+    const result = logs.map((l) => {
       const round = l.reviewRound || 1;
       const key = `${l._id}:${round}`;
       const rs = byLogRound.get(key) || [];
-      const approved = rs.filter(x => x.decision === "APPROVE").length;
-      const rejected = rs.filter(x => x.decision === "REJECT").length;
-      const reviewsForUi = rs.map(x => ({
+      const approved = rs.filter((x) => x.decision === "APPROVE").length;
+      const rejected = rs.filter((x) => x.decision === "REJECT").length;
+      const reviewsForUi = rs.map((x) => ({
         name: x.reviewerId?.name,
         role: x.reviewerId?.role,
         decision: x.decision,
@@ -538,7 +658,7 @@ app.get("/api/logs", auth, async (req, res) => {
         reviews: reviewsForUi,
         approvedCount: approved,
         rejectedCount: rejected,
-        reviewSummary: { approvals: approved, rejections: rejected, required: 2 }
+        reviewSummary: { approvals: approved, rejections: rejected, required: 2 },
       };
     });
 
@@ -578,7 +698,7 @@ app.get("/api/reviews/pending", auth, async (req, res) => {
 
     if (logs.length === 0) return res.json([]);
 
-    logs = logs.filter(l => requiredRolesFor(l.userId?.role).includes(req.user.role));
+    logs = logs.filter((l) => requiredRolesFor(l.userId?.role).includes(req.user.role));
     if (logs.length === 0) return res.json([]);
 
     const reviewerId = oid(req.user.id);
@@ -602,15 +722,22 @@ app.post("/api/reviews", auth, async (req, res) => {
 
     let log = await Log.findById(logId).populate("userId", "role");
     if (!log) return res.status(404).json({ error: "no log" });
-    if (String(log.userId) === req.user.id) return res.status(400).json({ error: "cannot review self" });
-    if (log.status !== "PENDING") return res.status(400).json({ error: "log is not pending review" });
+    if (String(log.userId) === req.user.id)
+      return res.status(400).json({ error: "cannot review self" });
+    if (log.status !== "PENDING")
+      return res.status(400).json({ error: "log is not pending review" });
 
     const round = log.reviewRound || 1;
     const needed = requiredRolesFor(log.userId.role);
-    if (!needed.includes(req.user.role)) return res.status(403).json({ error: "not allowed reviewer" });
+    if (!needed.includes(req.user.role))
+      return res.status(403).json({ error: "not allowed reviewer" });
 
     const norm = String(decision || "").trim().toUpperCase();
-    const finalDecision = norm.startsWith("APPROV") ? "APPROVE" : norm.startsWith("REJECT") ? "REJECT" : null;
+    const finalDecision = norm.startsWith("APPROV")
+      ? "APPROVE"
+      : norm.startsWith("REJECT")
+      ? "REJECT"
+      : null;
     if (!finalDecision) return res.status(400).json({ error: "bad decision" });
 
     const exists = await Review.findOne({ logId, reviewerId: req.user.id, round });
@@ -624,8 +751,11 @@ app.post("/api/reviews", auth, async (req, res) => {
       round,
     });
 
-    const roundReviews = await Review.find({ logId, round }).populate("reviewerId", "role");
-    if (roundReviews.some(r => r.decision === "REJECT")) {
+    const roundReviews = await Review.find({ logId, round }).populate(
+      "reviewerId",
+      "role"
+    );
+    if (roundReviews.some((r) => r.decision === "REJECT")) {
       log.status = "REJECTED";
       await log.save();
       await recomputeScoreInternal(log.userId, log.date);
@@ -633,9 +763,9 @@ app.post("/api/reviews", auth, async (req, res) => {
     }
 
     const approvedRoles = new Set(
-      roundReviews.filter(r => r.decision === "APPROVE").map(r => r.reviewerId?.role)
+      roundReviews.filter((r) => r.decision === "APPROVE").map((r) => r.reviewerId?.role)
     );
-    const allApproved = needed.every(role => approvedRoles.has(role));
+    const allApproved = needed.every((role) => approvedRoles.has(role));
     if (allApproved) {
       log.status = "VERIFIED";
       await log.save();
@@ -689,7 +819,10 @@ app.delete("/api/admin/logs/:id", auth, async (req, res) => {
 async function recomputeScoreInternal(userId, date) {
   try {
     const uid = toObjectIdSafe(userId);
-    if (!uid) { console.error("score recompute bad userId"); return; }
+    if (!uid) {
+      console.error("score recompute bad userId");
+      return;
+    }
     const dstr = normDateStr(date);
 
     const verifiedCount = await Log.countDocuments({
@@ -727,7 +860,10 @@ app.post("/api/score/recompute", auth, async (req, res) => {
     const dstr = normDateStr(date);
 
     await recomputeScoreInternal(uid, dstr);
-    const s = await scoresColl().findOne({ userId: uid, date: String(dstr || "") });
+    const s = await scoresColl().findOne({
+      userId: uid,
+      date: String(dstr || ""),
+    });
     res.json(
       s || { total: 0, tasksDone: 0, rawPoints: 0, proofBonus: 0, verifyBonus: 0 }
     );
@@ -742,14 +878,20 @@ app.get("/api/score", auth, async (req, res) => {
     const dstr = normDateStr(date);
     const s = await scoresColl().findOne({
       userId: toObjectIdSafe(req.user.id),
-      date: String(dstr || "")
+      date: String(dstr || ""),
     });
     res.json(
       s || { total: 0, tasksDone: 0, rawPoints: 0, proofBonus: 0, verifyBonus: 0 }
     );
   } catch (e) {
     console.error("score route error:", e);
-    res.json({ total: 0, tasksDone: 0, rawPoints: 0, proofBonus: 0, verifyBonus: 0 });
+    res.json({
+      total: 0,
+      tasksDone: 0,
+      rawPoints: 0,
+      proofBonus: 0,
+      verifyBonus: 0,
+    });
   }
 });
 
@@ -762,28 +904,39 @@ app.get("/api/scoreboard", auth, async (_req, res) => {
             $cond: [
               { $eq: [{ $type: "$userId" }, "objectId"] },
               "$userId",
-              { $convert: { input: "$userId", to: "objectId", onError: null, onNull: null } }
-            ]
+              {
+                $convert: {
+                  input: "$userId",
+                  to: "objectId",
+                  onError: null,
+                  onNull: null,
+                },
+              },
+            ],
           },
-          tasksNum: { $convert: { input: "$tasksDone", to: "int", onError: 0, onNull: 0 } },
-          totalNum: { $convert: { input: "$total",     to: "double", onError: 0, onNull: 0 } }
-        }
+          tasksNum: {
+            $convert: { input: "$tasksDone", to: "int", onError: 0, onNull: 0 },
+          },
+          totalNum: {
+            $convert: { input: "$total", to: "double", onError: 0, onNull: 0 },
+          },
+        },
       },
       { $match: { userIdObj: { $ne: null } } },
       {
         $group: {
           _id: "$userIdObj",
           tasksDone: { $sum: "$tasksNum" },
-          total:     { $sum: "$totalNum" }
-        }
+          total: { $sum: "$totalNum" },
+        },
       },
       {
         $lookup: {
           from: "users",
           localField: "_id",
           foreignField: "_id",
-          as: "user"
-        }
+          as: "user",
+        },
       },
       { $unwind: { path: "$user", preserveNullAndEmptyArrays: true } },
       {
@@ -793,10 +946,10 @@ app.get("/api/scoreboard", auth, async (_req, res) => {
           name: { $ifNull: ["$user.name", "Unknown"] },
           role: { $ifNull: ["$user.role", "?"] },
           tasksApproved: "$tasksDone",
-          total: 1
-        }
+          total: 1,
+        },
       },
-      { $sort: { total: -1, name: 1 } }
+      { $sort: { total: -1, name: 1 } },
     ]);
 
     const rows = await cursor.toArray();
@@ -816,19 +969,22 @@ app.post("/api/admin/score/reset", auth, async (req, res) => {
     const logs = await Log.find({}, { _id: 1, proofUrl: 1 });
     let files = 0;
     for (const l of logs) {
-      if (l.proofUrl) { removeProofFileIfLocal(l.proofUrl); files++; }
+      if (l.proofUrl) {
+        removeProofFileIfLocal(l.proofUrl);
+        files++;
+      }
     }
 
     const rReviews = await Review.deleteMany({});
-    const rLogs    = await Log.deleteMany({});
-    const rScores  = await scoresColl().deleteMany({});
+    const rLogs = await Log.deleteMany({});
+    const rScores = await scoresColl().deleteMany({});
 
     res.json({
       ok: true,
       deletedReviews: rReviews.deletedCount || 0,
-      deletedLogs:    rLogs.deletedCount || 0,
-      deletedFiles:   files,
-      deletedScores:  rScores.deletedCount || 0
+      deletedLogs: rLogs.deletedCount || 0,
+      deletedFiles: files,
+      deletedScores: rScores.deletedCount || 0,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -846,11 +1002,13 @@ app.post("/api/admin/score/rebuild", auth, async (req, res) => {
         { userId: null },
         { userId: { $type: "string" } },
         { userId: { $type: "object" } },
-        { userId: { $type: "array" } }
-      ]
+        { userId: { $type: "array" } },
+      ],
     });
 
-    const groups = await Log.aggregate([{ $group: { _id: { userId: "$userId", date: "$date" } } }]);
+    const groups = await Log.aggregate([
+      { $group: { _id: { userId: "$userId", date: "$date" } } },
+    ]);
     let n = 0;
     for (const g of groups) {
       await recomputeScoreInternal(g._id.userId, g._id.date);
@@ -876,7 +1034,8 @@ async function cleanupOldData() {
   const cutoffYMD = ymd(cutoff);
 
   const oldLogs = await Log.find({ date: { $lt: cutoffYMD } });
-  if (oldLogs.length === 0) return { deletedLogs: 0, deletedReviews: 0, deletedFiles: 0 };
+  if (oldLogs.length === 0)
+    return { deletedLogs: 0, deletedReviews: 0, deletedFiles: 0 };
 
   const ids = [];
   let files = 0;
@@ -891,7 +1050,11 @@ async function cleanupOldData() {
   const r = await Review.deleteMany({ logId: { $in: ids } });
   const x = await Log.deleteMany({ _id: { $in: ids } });
 
-  return { deletedLogs: x.deletedCount || 0, deletedReviews: r.deletedCount || 0, deletedFiles: files };
+  return {
+    deletedLogs: x.deletedCount || 0,
+    deletedReviews: r.deletedCount || 0,
+    deletedFiles: files,
+  };
 }
 
 app.post("/api/admin/cleanup-old", auth, async (req, res) => {
@@ -911,7 +1074,9 @@ setInterval(() => {
 }, 6 * 60 * 60 * 1000);
 
 /* ============================ process ========================= */
-process.on("unhandledRejection", (err) => console.error("Unhandled Rejection:", err));
+process.on("unhandledRejection", (err) =>
+  console.error("Unhandled Rejection:", err)
+);
 process.on("uncaughtException", (err) => {
   console.error("Uncaught Exception:", err);
   process.exit(1);
