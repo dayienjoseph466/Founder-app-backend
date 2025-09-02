@@ -16,6 +16,7 @@ const Task = require("./models/Task");
 const Log = require("./models/Log");
 const Review = require("./models/Review");
 const Admin = require("./models/Admin"); // <-- Admin model
+const Announcement = require("./models/Announcement"); // <-- added
 const auth = require("./middleware/auth");
 
 const app = express();
@@ -528,6 +529,54 @@ app.delete("/api/admin/tasks/:id", auth, async (req, res) => {
 
     const t = await Task.findByIdAndDelete(req.params.id);
     if (!t) return res.status(404).json({ error: "task not found" });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ====================== announcements ========================= */
+// list announcements for everyone
+app.get("/api/announcements", auth, async (req, res) => {
+  try {
+    const { limit = 50 } = req.query;
+    const rows = await Announcement.find({})
+      .sort({ pinned: -1, createdAt: -1 })
+      .limit(Number(limit));
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// create announcement only ADMIN or CEO
+app.post("/api/announcements", auth, async (req, res) => {
+  try {
+    if (req.user.role !== "ADMIN" && req.user.role !== "CEO") {
+      return res.status(403).json({ error: "only admin or ceo can post" });
+    }
+    const { title, body, pinned = false } = req.body || {};
+    if (!title || !body) return res.status(400).json({ error: "missing fields" });
+
+    const doc = await Announcement.create({
+      title: String(title).trim(),
+      body: String(body).trim(),
+      pinned: Boolean(pinned),
+      createdBy: { _id: req.user.id, name: req.user.name, role: req.user.role },
+    });
+    res.json(doc);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// delete announcement only ADMIN or CEO
+app.delete("/api/announcements/:id", auth, async (req, res) => {
+  try {
+    if (req.user.role !== "ADMIN" && req.user.role !== "CEO") {
+      return res.status(403).json({ error: "only admin or ceo" });
+    }
+    await Announcement.findByIdAndDelete(req.params.id);
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
